@@ -10,7 +10,9 @@ cd "$(dirname "$0")"
 
 variants=(mldsa44 mldsa65 mldsa87 \
           mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 \
-          p256-m p256-oreparaz)
+          p256-m p256-oreparaz \
+          sb-mldsa44-v1 sb-mldsa44-v2 sb-mldsa44-v3 sb-mldsa44-v4 sb-mldsa44-v5 \
+          sb-mldsa44-v6 sb-mldsa44-v7 sb-mldsa44-v8 sb-mldsa44-v9 sb-mldsa44-v10)
 
 # OPT can be overridden to compare -O3 vs -O2 etc. Defaults match the
 # Makefile's OPT default (-O3).
