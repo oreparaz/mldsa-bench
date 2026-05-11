@@ -8,7 +8,14 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-variants=(mldsa44 mldsa65 mldsa87 p256-m p256-oreparaz)
+variants=(mldsa44 mldsa65 mldsa87 \
+          mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 \
+          p256-m p256-oreparaz)
+
+# OPT can be overridden to compare -O3 vs -O2 etc. Defaults match the
+# Makefile's OPT default (-O3).
+export OPT=${OPT:--O3}
+echo "# Optimization level: $OPT"
 declare -A insns_0 insns_1 insns_11 digests
 
 for v in "${variants[@]}"; do
@@ -24,12 +31,12 @@ for v in "${variants[@]}"; do
     done
 done
 
-printf "\n%-16s %12s %12s %12s %14s\n" \
+printf "\n%-18s %12s %12s %12s %14s\n" \
     bench iters=0 iters=1 iters=11 per-iter
-printf "%-16s %12s %12s %12s %14s\n" \
-    ---------------- ------------ ------------ ------------ --------------
+printf "%-18s %12s %12s %12s %14s\n" \
+    ------------------ ------------ ------------ ------------ --------------
 for v in "${variants[@]}"; do
     per_iter=$(( (insns_11[$v] - insns_1[$v]) / 10 ))
-    printf "%-16s %12s %12s %12s %14s\n" \
+    printf "%-18s %12s %12s %12s %14s\n" \
         "$v" "${insns_0[$v]}" "${insns_1[$v]}" "${insns_11[$v]}" "$per_iter"
 done

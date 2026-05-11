@@ -26,9 +26,16 @@ clone https://github.com/mpg/p256-m.git \
 clone https://github.com/oreparaz/p256.git \
       d7a8c42ddf72ddbd6186bb28d19a853e7deeb333 \
       p256
+clone https://github.com/mupq/pqm4.git \
+      a24bb4b662016968c19f5e6a0719c9ad530f0286 \
+      pqm4
+
+# pqm4 carries its shared sources (fips202, keccakf1600 asm) in a submodule.
+(cd pqm4 && git submodule update --init --recursive --depth=1) >/dev/null
 
 echo
 echo "Next: build the plugin-enabled QEMU 11.0.0 and the TCG plugin:"
 echo "  (cd cyclebench-m4 && make qemu) && make -C cyclebench-m4/plugin"
 echo "Then run the sweep:"
-echo "  (cd bench && ./run_sweep.sh)"
+echo "  (cd bench && OPT=-O3 ./run_sweep.sh)"
+echo "  (cd bench && OPT=-O2 ./run_sweep.sh)"

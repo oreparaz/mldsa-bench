@@ -26,10 +26,11 @@ QEMU       ?= $(CB_DIR)/qemu/build/qemu-system-arm
 PLUGIN     := $(CB_DIR)/plugin/libinsn_count.so
 
 # ---- common M4 flags ----
-# -O3 for speed — matches the mldsa-native monolithic_build example.
+# OPT defaults to -O3 ("optimized for speed"). Override with OPT=-O2 etc.
+OPT ?= -O3
 M4FLAGS_COMMON = \
     -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
-    -ffreestanding -nostartfiles -O3 -g -Wall -Wextra \
+    -ffreestanding -nostartfiles $(OPT) -g -Wall -Wextra \
     -ffunction-sections -fdata-sections \
     -Wno-type-limits \
     -DBAREMETAL -I$(REPO_ROOT)/bench/common
@@ -66,6 +67,33 @@ P256_DIR := $(REPO_ROOT)/p256
 P256_FLAGS = -I$(P256_DIR) -Wno-pedantic -Wno-unused-parameter \
              -Wno-sign-compare
 
+# ---- pqm4 ML-DSA (m4f-asm-tuned Cortex-M4 backend) ----
+# The verify path pulls in: every .c/.S in crypto_sign/ml-dsa-XX/m4f/ plus
+# the shared symcrypto sources (fips202.c + keccakf1600.S). --gc-sections
+# drops the sign/keygen-only code (which references randombytes) at link
+# time.
+PQM4 := $(REPO_ROOT)/pqm4
+PQM4_SYMCRYPTO := \
+    $(PQM4)/mupq/common/fips202.c \
+    $(PQM4)/common/keccakf1600.S
+PQM4_FLAGS = -Wno-pedantic -Wno-sign-conversion -Wno-conversion \
+             -Wno-shadow -Wno-redundant-decls -Wno-missing-prototypes \
+             -Wno-unused-function -Wno-unused-but-set-variable \
+             -I$(PQM4)/mupq/common -I$(MLD_VECTORS_DIR)
+# Sources for each parameter set are globbed from the m4f directory.
+PQM4_MLDSA44_DIR := $(PQM4)/crypto_sign/ml-dsa-44/m4f
+PQM4_MLDSA65_DIR := $(PQM4)/crypto_sign/ml-dsa-65/m4f
+PQM4_MLDSA87_DIR := $(PQM4)/crypto_sign/ml-dsa-87/m4f
+PQM4_MLDSA44_SRCS := $(wildcard $(PQM4_MLDSA44_DIR)/*.c) \
+                     $(wildcard $(PQM4_MLDSA44_DIR)/*.S) \
+                     $(wildcard $(PQM4_MLDSA44_DIR)/*.s)
+PQM4_MLDSA65_SRCS := $(wildcard $(PQM4_MLDSA65_DIR)/*.c) \
+                     $(wildcard $(PQM4_MLDSA65_DIR)/*.S) \
+                     $(wildcard $(PQM4_MLDSA65_DIR)/*.s)
+PQM4_MLDSA87_SRCS := $(wildcard $(PQM4_MLDSA87_DIR)/*.c) \
+                     $(wildcard $(PQM4_MLDSA87_DIR)/*.S) \
+                     $(wildcard $(PQM4_MLDSA87_DIR)/*.s)
+
 # ============================================================
 # per-bench ELF rules
 #
@@ -75,14 +103,21 @@ P256_FLAGS = -I$(P256_DIR) -Wno-pedantic -Wno-unused-parameter \
 # variants and a few seconds for ml-dsa (one big TU).
 # ============================================================
 
-.PHONY: all mldsa44 mldsa65 mldsa87 p256-m p256-oreparaz \
+.PHONY: all \
+        mldsa44 mldsa65 mldsa87 \
+        mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 \
+        p256-m p256-oreparaz \
         $(BUILD)/mldsa44.elf $(BUILD)/mldsa65.elf $(BUILD)/mldsa87.elf \
+        $(BUILD)/mldsa-pqm4-44.elf $(BUILD)/mldsa-pqm4-65.elf $(BUILD)/mldsa-pqm4-87.elf \
         $(BUILD)/p256-m.elf $(BUILD)/p256-oreparaz.elf
-all: mldsa44 mldsa65 mldsa87 p256-m p256-oreparaz
+all: mldsa44 mldsa65 mldsa87 mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 p256-m p256-oreparaz
 
 mldsa44:        $(BUILD)/mldsa44.elf
 mldsa65:        $(BUILD)/mldsa65.elf
 mldsa87:        $(BUILD)/mldsa87.elf
+mldsa-pqm4-44:  $(BUILD)/mldsa-pqm4-44.elf
+mldsa-pqm4-65:  $(BUILD)/mldsa-pqm4-65.elf
+mldsa-pqm4-87:  $(BUILD)/mldsa-pqm4-87.elf
 p256-m:         $(BUILD)/p256-m.elf
 p256-oreparaz:  $(BUILD)/p256-oreparaz.elf
 
@@ -110,6 +145,36 @@ $(BUILD)/mldsa87.elf: | $(BUILD)
 	@echo "  CC[m4] $@ (ITERS=$(ITERS) PARAM=87)"
 	@$(MLD_CC) -DMLD_CONFIG_PARAMETER_SET=87 $(M4LDFLAGS) -o $@ \
 	    $(REPO_ROOT)/bench/mldsa87/bench_main.c $(MLD_SRC) $(COMMON_SRCS)
+	@$(SIZE_M4) $@
+
+$(BUILD)/mldsa-pqm4-44.elf: | $(BUILD)
+	@rm -f $@
+	@echo "  CC[m4] $@ (ITERS=$(ITERS) DILITHIUM_MODE=2)"
+	@$(CC_M4) $(M4FLAGS_COMMON) $(PQM4_FLAGS) -I$(PQM4_MLDSA44_DIR) \
+	    -DBENCH_ITERS=$(ITERS) \
+	    $(M4LDFLAGS) -o $@ \
+	    $(REPO_ROOT)/bench/mldsa-pqm4-44/bench_main.c \
+	    $(PQM4_MLDSA44_SRCS) $(PQM4_SYMCRYPTO) $(COMMON_SRCS)
+	@$(SIZE_M4) $@
+
+$(BUILD)/mldsa-pqm4-65.elf: | $(BUILD)
+	@rm -f $@
+	@echo "  CC[m4] $@ (ITERS=$(ITERS) DILITHIUM_MODE=3)"
+	@$(CC_M4) $(M4FLAGS_COMMON) $(PQM4_FLAGS) -I$(PQM4_MLDSA65_DIR) \
+	    -DBENCH_ITERS=$(ITERS) \
+	    $(M4LDFLAGS) -o $@ \
+	    $(REPO_ROOT)/bench/mldsa-pqm4-65/bench_main.c \
+	    $(PQM4_MLDSA65_SRCS) $(PQM4_SYMCRYPTO) $(COMMON_SRCS)
+	@$(SIZE_M4) $@
+
+$(BUILD)/mldsa-pqm4-87.elf: | $(BUILD)
+	@rm -f $@
+	@echo "  CC[m4] $@ (ITERS=$(ITERS) DILITHIUM_MODE=5)"
+	@$(CC_M4) $(M4FLAGS_COMMON) $(PQM4_FLAGS) -I$(PQM4_MLDSA87_DIR) \
+	    -DBENCH_ITERS=$(ITERS) \
+	    $(M4LDFLAGS) -o $@ \
+	    $(REPO_ROOT)/bench/mldsa-pqm4-87/bench_main.c \
+	    $(PQM4_MLDSA87_SRCS) $(PQM4_SYMCRYPTO) $(COMMON_SRCS)
 	@$(SIZE_M4) $@
 
 $(BUILD)/p256-m.elf: | $(BUILD)
