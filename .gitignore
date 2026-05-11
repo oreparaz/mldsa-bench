@@ -1,0 +1,13 @@
+# build artifacts
+build/
+*.o
+*.elf
+*.map
+*.a
+*.so
+
+# Fetched upstream sources — populated by ./setup.sh, pinned to SHAs in there.
+/cyclebench-m4/
+/mldsa-native/
+/p256/
+/p256-m/
