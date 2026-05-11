@@ -103,7 +103,7 @@ PQM4_MLDSA87_SRCS := $(wildcard $(PQM4_MLDSA87_DIR)/*.c) \
 # variants and a few seconds for ml-dsa (one big TU).
 # ============================================================
 
-SB_VERSIONS := v1 v2 v3 v4 v5 v6 v7 v8
+SB_VERSIONS := v1 v2 v3 v4 v5 v6 v7 v8 v9
 SB_TARGETS  := $(addprefix sb-mldsa44-,$(SB_VERSIONS))
 SB_ELFS     := $(addsuffix .elf,$(addprefix $(BUILD)/,$(SB_TARGETS)))
 
