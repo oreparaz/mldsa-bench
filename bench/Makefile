@@ -31,6 +31,7 @@ M4FLAGS_COMMON = \
     -mcpu=cortex-m4 -mthumb -mfpu=fpv4-sp-d16 -mfloat-abi=hard \
     -ffreestanding -nostartfiles -O3 -g -Wall -Wextra \
     -ffunction-sections -fdata-sections \
+    -Wno-type-limits \
     -DBAREMETAL -I$(REPO_ROOT)/bench/common
 
 M4LDFLAGS = -T $(REPO_ROOT)/bench/common/link.ld \
