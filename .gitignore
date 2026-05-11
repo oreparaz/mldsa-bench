@@ -12,3 +12,4 @@ build/
 /p256/
 /p256-m/
 /pqm4/
+tools/gen_sb_testvec
