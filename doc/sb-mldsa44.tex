@@ -56,8 +56,11 @@
 
 \begin{abstract}
 We present a custom verifier for ML-DSA-44 (NIST FIPS 204) targeted at
-secure-boot deployments on the ARM Cortex-M4. Starting from the fastest
-publicly available implementation (\texttt{pqm4}'s \texttt{m4f} backend),
+secure-boot deployments on the ARM Cortex-M4. Starting from
+\texttt{pqm4}'s \texttt{m4f} backend --- the fastest publicly
+available Cortex-M4 verifier we benchmarked, beating both
+\texttt{mldsa-native}'s portable C90 and the round-3 Dilithium2
+implementation in \texttt{FasterKyberDilithiumM4} on this metric ---
 we apply ten layered optimizations and reduce per-verify cost from
 $1{,}261{,}555$ to $241{,}756$ instructions retired on the
 Cortex-M4 ISA --- a $\mathbf{5.22\times}$ speedup. The optimizations exploit
@@ -66,14 +69,22 @@ verification:
 (i)~the public key is fixed at provisioning time, so any quantity that
 depends only on $\textsf{pk}$ may be precomputed and stored in flash;
 (ii)~all verifier inputs are public, so the constant-time discipline of
-\texttt{pqm4} is no longer load-bearing. Nine of the ten variants are
-provably equivalent to FIPS 204 verify on every input; one variant
-($\textsf{v9}$, which removes a polynomial reduction we conjecture to
-be redundant under our pre-invNTT bounds) has an open soundness question
-we have not closed by worst-case analysis but that we verify empirically
-on the test vector $\texttt{mldsa-native}$ produces. We give both
-high-level intuition and the precise transformations applied at each step,
-with measurements at every checkpoint reproducible from a small QEMU
+\texttt{pqm4} is no longer load-bearing.
+
+The verifier is \emph{not} a drop-in replacement for a general ML-DSA-44
+verify routine: it is hard-specialized to the provisioned public key
+and rejects any input with non-empty context. On the secure-boot input
+subset (ML-DSA-44, the provisioned $\textsf{pk}$, $|\mathrm{ctx}|=0$),
+nine of the ten variants are accept/reject-equivalent to FIPS 204
+Algorithm 3 \emph{by construction} (every transformation either
+precomputes a deterministic function of $\textsf{pk}$ or refactors C
+code without changing its behaviour). One variant ($\textsf{v9}$,
+which removes a polynomial reduction we conjecture to be redundant
+under our pre-invNTT bounds) has an open soundness question we have
+not closed by worst-case analysis; we verify it empirically on the
+test vector $\texttt{mldsa-native}$ produces. We give both high-level
+intuition and the precise transformations applied at each step, with
+measurements at every checkpoint reproducible from a small QEMU
 harness.\smallskip
 
 \noindent\textbf{Headline:} ML-DSA-44 signature verification on Cortex-M4
@@ -343,26 +354,53 @@ secure boot:
         signature, and the public key are all attacker-visible. The
         constant-time discipline that protects ML-DSA \emph{signing} from
         side-channel attacks is therefore unnecessary on the verify side.
-  \item \textbf{Spec-conforming.} The verifier reproduces the accept/
-        reject decision of FIPS~204 Algorithm~3 on every input the spec
-        defines. Skipping any of the algorithm's validation steps (norm
-        bound on $\mathbf{z}$, well-formedness of $\mathbf{h}$, monotone
-        encoding) is \emph{not} permitted. Internal representations
-        and arithmetic detours that are unobservable at the
-        accept/reject boundary (e.g.\ working entirely in NTT-Montgomery
-        domain, or precomputing $\NTT(\mathbf{A})$) are. The one case
-        in this series where we have not closed the equivalence proof
+  \item \textbf{Conformant on the secure-boot input subset.} Define
+        the secure-boot input subset $\mathcal{I}_{\mathrm{sb}}$ as
+        the set of $(\textsf{pk}, M, \mathrm{ctx}, \sigma)$ tuples
+        where $\textsf{pk}$ equals the provisioned key and
+        $|\mathrm{ctx}| = 0$. The verifier reproduces the
+        accept/reject decision of FIPS~204 Algorithm~3 on every input
+        in $\mathcal{I}_{\mathrm{sb}}$; on inputs outside this subset
+        (different $\textsf{pk}$, or non-empty $\mathrm{ctx}$) it
+        deliberately rejects. Skipping any of the algorithm's
+        validation steps (norm bound on $\mathbf{z}$, well-formedness
+        of $\mathbf{h}$, monotone hint encoding) is \emph{not}
+        permitted within $\mathcal{I}_{\mathrm{sb}}$. Internal
+        representations and arithmetic detours that are unobservable
+        at the accept/reject boundary (e.g.\ working entirely in
+        NTT-Montgomery domain, or precomputing $\NTT(\mathbf{A})$) are
+        permitted. The one case in this series where we have not
+        closed the equivalence proof even on $\mathcal{I}_{\mathrm{sb}}$
         is $\textsf{v9}$'s skipped pre-invNTT reduction; we flag it
         prominently rather than asserting full conformance there.
-  \item \textbf{Single-message-shape.} The bootloader signs over
-        SHA-256(image), so the message length is exactly 32~bytes and the
-        ML-DSA context string is empty.
+  \item \textbf{Empty context.} The bootloader signs without a context
+        string ($|\mathrm{ctx}|=0$). This is the only message-shape
+        assumption the optimized verifier actually \emph{bakes in}: the
+        2-byte $\mathtt{0x00\,0x00}$ prefix becomes part of the
+        pre-warmed Keccak template at $\textsf{v5}$, and the verifier
+        explicitly rejects inputs with non-zero $|\mathrm{ctx}|$. The
+        message itself flows through the verifier with an arbitrary
+        length \texttt{mlen} (in our benchmark, $\mathtt{mlen}=32$
+        because the bootloader signs over $\mathrm{SHA}\text{-}256$ of
+        the image, but no version specializes around the value 32).
 \end{enumerate}
 
 We adopt the convention that ``do not cheat'' means: every value the
-verifier outputs is the value FIPS~204 would compute on the same inputs.
-Pre-storing $\NTT(\mathbf{A})$ in flash is legitimate; hardcoding the
-verify result is not.
+verifier outputs on inputs in $\mathcal{I}_{\mathrm{sb}}$ is the value
+FIPS~204 would compute on the same inputs. Pre-storing
+$\NTT(\mathbf{A})$ in flash is legitimate; hardcoding the verify result
+is not.
+
+\paragraph{Where precomputes live.} In the bench harness all
+precomputed tables live in \texttt{.bss} (RAM-backed
+\texttt{static}~arrays) so the QEMU run is self-contained. A real
+secure-boot deployment would place them in flash; on a device with
+flash wait-states, that changes the read-side cost of every verify by
+the wait-state-times-cache-miss-rate factor. Our instruction-retired
+metric does not model this, so the absolute cycle counts on real
+silicon will be slightly higher than a naive \texttt{insns} $\to$
+\texttt{cycles} translation suggests when precomputes are in flash;
+the relative ranking of variants is unaffected.
 
 \section{Optimizations}
 \label{sec:opts}
@@ -670,7 +708,13 @@ in earlier work (Table~\ref{tab:cross}):
 
 \begin{table}[h]
 \centering
-\caption{Cross-library verify cost on Cortex-M4 (instructions retired).}
+\caption{Cross-library verify cost on Cortex-M4 (instructions retired
+under $-$O3 with the harness described in
+Section~\ref{sec:results}). The two Dilithium2 entries below the line
+follow the round-3 Dilithium specification rather than FIPS 204
+ML-DSA-44, so they do not share byte-level test vectors with the
+upper entries; the algebra is identical and the instruction counts
+are directly comparable.}
 \label{tab:cross}
 \begin{tabular}{l r r}
 \toprule
@@ -679,11 +723,23 @@ Implementation                              & Insns retired   & vs \textsf{v10} 
 $\textsf{sb-mldsa44-v10}$ (this work)        & $\mathbf{241{,}756}$ & $1.00\times$ \\
 pqm4 m4f ML-DSA-44 (generic, M4 asm)         & $1{,}270{,}759$       & $5.26\times$ \\
 mldsa-native ML-DSA-44 (portable C90)        & $2{,}120{,}554$       & $8.77\times$ \\
+\midrule
+FasterKyberDilithiumM4 Dilithium2 ``new''~\cite{fkd} & $1{,}335{,}713$ & $5.52\times$ \\
+\midrule
 oreparaz/p256 ECDSA (pure C, incl.\ SHA-256) & $8{,}122{,}459$       & $33.6\times$ \\
 p256-m ECDSA (M4 UMAAL asm)                  & $12{,}320{,}435$      & $51.0\times$ \\
 \bottomrule
 \end{tabular}
 \end{table}
+
+The FasterKyberDilithiumM4 measurement is worth a remark. The repository's
+published wins are concentrated on the signing side (where the rejection
+loop dominates and the small-modulus NTTs are most useful); for verify
+the structure is essentially pqm4's loop with the matrix materialized
+on the stack rather than streamed. The 5\% gap to \texttt{pqm4 m4f} we
+measure reflects that materialization plus minor compiler scheduling
+differences --- not the underlying primitives, which are largely the
+same hand-tuned assembly.
 
 \section{Discussion}
 \label{sec:discussion}
@@ -770,14 +826,18 @@ the secure-boot variants). After \texttt{./setup.sh},
 
 ML-DSA-44 signature verification on a Cortex-M4 was already faster than
 P-256 ECDSA verification in every off-the-shelf configuration we
-measured. By exploiting two structural properties of secure-boot
+benchmarked. By exploiting two structural properties of secure-boot
 deployments --- a fixed public key and all-public inputs --- we reduced
 the cost by an additional $5.22\times$, to $\sim$242\,k instructions
-retired per verify. Of that reduction, $\sim$84\% comes from
-precomputing the $\textsf{pk}$-dependent matrix $\mathbf{A}$ and the
-$\textsf{pk}$-derived $tr$ hash; the remaining $\sim$10\%
-from a long tail of tactical fusions and elided abstraction. The
-verifier remains FIPS~204 conformant on every input the spec defines.
+retired per verify. The two $\textsf{pk}$-precomputation steps
+($\textsf{v2}$ and $\textsf{v4}$) account for $75.4\%$ of $\textsf{v1}$'s
+original cost (or, equivalently, $93.2\%$ of all instructions we removed
+across the ten variants); the remaining seven transformations contribute
+another $5.5\%$ of original cost. The verifier reproduces the FIPS-204
+accept/reject decision on the secure-boot input subset
+$\mathcal{I}_{\mathrm{sb}}$ defined in Section~\ref{sec:secure-boot} ---
+modulo the open soundness item flagged at $\textsf{v9}$ --- and
+deliberately rejects every input outside that subset.
 
 \begin{thebibliography}{9}
 \bibitem{dilithium}
@@ -817,6 +877,12 @@ M.~P\'egouri\'e-Gonnard.
 \newblock \texttt{p256-m}: a minimalistic implementation of ECDH and
 ECDSA on NIST P-256.
 \newblock \url{https://github.com/mpg/p256-m}.
+
+\bibitem{fkd}
+\texttt{FasterKyberDilithiumM4}: a Cortex-M4 implementation of Kyber
+and Dilithium with further NTT and pointwise improvements over
+\texttt{pqm4}.
+\newblock \url{https://github.com/FasterKyberDilithiumM4/FasterKyberDilithiumM4}.
 
 \end{thebibliography}
 
