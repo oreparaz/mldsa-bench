@@ -13,3 +13,9 @@ build/
 /p256-m/
 /pqm4/
 tools/gen_sb_testvec
+
+# LaTeX build intermediates
+doc/*.aux
+doc/*.log
+doc/*.out
+doc/*.toc

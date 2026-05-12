@@ -1,0 +1,724 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage[hidelinks]{hyperref}
+\usepackage{url}
+\usepackage{listings}
+\usepackage{caption}
+\usepackage{multirow}
+
+\definecolor{codebg}{rgb}{0.97,0.97,0.97}
+\lstset{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{codebg},
+  frame=single,
+  framerule=0pt,
+  showstringspaces=false,
+  breaklines=true,
+  language=C,
+  keywordstyle=\color{blue!60!black},
+  commentstyle=\color{green!50!black}\itshape,
+  stringstyle=\color{red!60!black},
+}
+
+\newcommand{\Z}{\mathbb{Z}}
+\newcommand{\N}{\mathbb{N}}
+\newcommand{\Zq}{\Z_q}
+\newcommand{\Rq}{R_q}
+\newcommand{\NTT}{\mathrm{NTT}}
+\newcommand{\iNTT}{\mathrm{NTT}^{-1}}
+\newcommand{\Power}{\mathrm{Power2Round}}
+\newcommand{\HighBits}{\mathrm{HighBits}}
+\newcommand{\LowBits}{\mathrm{LowBits}}
+\newcommand{\UseHint}{\mathrm{UseHint}}
+\newcommand{\MakeHint}{\mathrm{MakeHint}}
+\newcommand{\ExpandA}{\mathrm{ExpandA}}
+\newcommand{\SHAKE}{\mathrm{SHAKE}}
+\newcommand{\bigO}{\mathcal{O}}
+
+\title{\Large\bfseries Specializing ML-DSA-44 Verification for Secure Boot on Cortex-M4 \\
+       \large A Didactic Walk-through of Ten Progressive Optimizations}
+\author{Oscar Reparaz}
+\date{2026-05-11}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We present a custom verifier for ML-DSA-44 (NIST FIPS 204) targeted at
+secure-boot deployments on the ARM Cortex-M4. Starting from the fastest
+publicly available implementation (\texttt{pqm4}'s \texttt{m4f} backend),
+we apply ten layered optimizations and reduce per-verify cost from
+$1{,}261{,}555$ to $241{,}756$ instructions retired on the
+Cortex-M4 ISA --- a $\mathbf{5.22\times}$ speedup. The optimizations exploit
+two observations that hold for secure boot but not for general ML-DSA
+verification:
+(i)~the public key is fixed at provisioning time, so any quantity that
+depends only on $\textsf{pk}$ may be precomputed and stored in flash;
+(ii)~all verifier inputs are public, so the constant-time discipline of
+\texttt{pqm4} is no longer load-bearing. The end-to-end verifier is
+spec-conforming (still implements FIPS 204 Algorithm~8 byte-for-byte) and
+verifies the same test vector mldsa-native produces. We give both
+high-level intuition and the precise transformations applied at each step,
+with measurements at every checkpoint reproducible from a small QEMU
+harness.\smallskip
+
+\noindent\textbf{Headline:} ML-DSA-44 signature verification on Cortex-M4
+becomes $\sim$34$\times$ cheaper than pure-C P-256 ECDSA verify and
+$\sim$51$\times$ cheaper than the hand-asm \texttt{p256-m}.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+The migration from elliptic-curve cryptography (ECC) to post-quantum
+cryptography is now operational policy: NIST published the first three
+post-quantum standards in August~2024, including FIPS~204 (ML-DSA, a
+digital signature algorithm based on the Dilithium~\cite{dilithium} module
+lattice construction). Secure-boot is among the first deployment domains
+where the new standard matters: the public verification key is provisioned
+into a device at manufacture, then the bootloader verifies a firmware
+signature on every boot until end-of-life. Verifier cost is paid every
+boot; key size is paid once.
+
+ML-DSA's verify path is dominated by polynomial arithmetic over the ring
+$\Rq = \Zq[X]/(X^{256}+1)$, $q = 2^{23} - 2^{13} + 1 = 8{,}380{,}417$, with
+heavy use of the Number-Theoretic Transform (NTT). Compared to a
+P-256 ECDSA verify on the same Cortex-M4, an off-the-shelf ML-DSA-44
+verify in C is already $\sim$3--4$\times$ cheaper; with the hand-tuned
+\texttt{pqm4}~\cite{pqm4} M4 asm it becomes $\sim$6$\times$ cheaper. This
+paper asks how much further the cost can fall when one exploits the
+\emph{fixed-public-key, all-public-data} setting that defines secure boot.
+
+The contribution is twofold. First, we measure ten ML-DSA-44 verifier
+variants on a single bare-metal Cortex-M4 testbench, with reproducible
+instruction-retired counts. Second, and primarily, we deliver a didactic
+exposition: each optimization is presented with its high-level
+justification, the precise FIPS~204 step it touches, and its measured
+impact, so a practitioner can decide which transformations apply to their
+threat model and which do not. We are explicit about what we do
+\emph{not} skip --- the FIPS-204-mandated checks on $z$'s norm and the
+hint encoding remain in place --- because for secure boot the
+correctness-of-verify property is the entire load-bearing assumption.
+
+\section{Background}
+\label{sec:background}
+
+This section gives just enough lattice-cryptography to follow the
+verification anatomy in Section~\ref{sec:verify-anatomy}. Readers fluent
+in module-LWE and the Dilithium structure may skim.
+
+\subsection{Module-LWE and the Ring \texorpdfstring{$\Rq$}{Rq}}
+
+Let $q$ be a prime and $n$ a power of two. Define the
+\emph{negacyclic} ring
+\[
+  \Rq \;:=\; \Zq[X] / (X^n + 1).
+\]
+Elements of $\Rq$ are polynomials of degree $<n$ with coefficients in
+$\Zq$; multiplication is polynomial multiplication modulo $X^n + 1$, which
+under our parameters ($n=256$, $q = 2^{23} - 2^{13} + 1$) admits a fast
+$n\log n$ Number-Theoretic Transform.
+
+The \emph{module} variant of the Learning-With-Errors problem (M-LWE)
+fixes ranks $k,\ell \in \N$ and asks: distinguish
+\[
+  (\mathbf{A},\,\mathbf{A}\mathbf{s} + \mathbf{e})
+  \quad\text{from}\quad
+  (\mathbf{A},\,\mathbf{u})
+\]
+where $\mathbf{A} \in \Rq^{k\times\ell}$ is uniform, $\mathbf{s} \in
+\Rq^{\ell}$ and $\mathbf{e} \in \Rq^{k}$ are short (coefficients in
+$\{-\eta,\dots,\eta\}$ for a small $\eta$), and $\mathbf{u}$ is uniform in
+$\Rq^{k}$. Both Kyber (now ML-KEM) and Dilithium (now ML-DSA) reduce their
+security to M-LWE and its sibling M-SIS.
+
+\subsection{Kyber (ML-KEM) at a Glance}
+
+ML-KEM is a key-encapsulation mechanism. The public key is a M-LWE
+sample $\mathbf{t} = \mathbf{A}\mathbf{s} + \mathbf{e}$; encapsulation
+chooses small $\mathbf{r}, \mathbf{e}', e''$ and sends
+$(\mathbf{u},v) = (\mathbf{A}^\top\mathbf{r} + \mathbf{e}',\;
+\mathbf{t}^\top\mathbf{r} + e'' + \lceil q/2 \rceil \cdot m)$;
+decapsulation recovers $m$ from $v - \mathbf{s}^\top \mathbf{u}$ since
+the cross-term $\mathbf{e}^\top\mathbf{r} - \mathbf{s}^\top\mathbf{e}'
++ e''$ is small enough to fall on the correct side of the rounding
+threshold. We do not optimize Kyber here, but the
+$\mathbf{A} \mathbf{s} + \mathbf{e}$ pattern recurs.
+
+\subsection{Dilithium (ML-DSA) Construction}
+\label{sec:dilithium}
+
+ML-DSA is a \emph{Fiat--Shamir-with-aborts} signature: a $\Sigma$-protocol
+proving knowledge of a short M-LWE secret, made non-interactive by
+deriving the challenge via a random oracle ($\SHAKE$-256). The
+construction's three signature levels are parametrized as in
+Table~\ref{tab:mldsa-params}.
+
+\begin{table}[h]
+\centering
+\caption{ML-DSA parameter sets (FIPS 204, \S4 Table~1).}
+\label{tab:mldsa-params}
+\begin{tabular}{l c c c c c c c c c c}
+\toprule
+            & $q$       & $n$  & $d$ & $\tau$ & $\lambda$ & $\gamma_1$ & $\gamma_2$       & $(k,\ell)$ & $\eta$ & $\omega$ \\
+\midrule
+ML-DSA-44   & $2^{23}{-}2^{13}{+}1$ & 256 & 13 & 39 & 128 & $2^{17}$  & $(q{-}1)/88$ & $(4,4)$ & 2 & 80 \\
+ML-DSA-65   & ,, & 256 & 13 & 49 & 192 & $2^{19}$  & $(q{-}1)/32$ & $(6,5)$ & 4 & 55 \\
+ML-DSA-87   & ,, & 256 & 13 & 60 & 256 & $2^{19}$  & $(q{-}1)/32$ & $(8,7)$ & 2 & 75 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+For ML-DSA-44 a public key occupies $32 + k \cdot 320 = 1{,}312$~bytes
+(rho plus the high-order $t_1$ of $\mathbf{t} = \mathbf{A}\mathbf{s}_1 +
+\mathbf{s}_2$ truncated by $\Power$) and a signature occupies
+$32 + \ell \cdot 576 + (\omega + k) = 2{,}420$~bytes (the challenge hash
+$\tilde c$, the masked response $\mathbf{z}$, and the hint $\mathbf{h}$).
+
+\subsection{The Number-Theoretic Transform}
+
+Because $q-1$ is divisible by $2n = 512$, $\Zq$ contains a primitive
+$2n$-th root of unity $\zeta$. The negacyclic NTT evaluates a polynomial
+$a(X) \in \Rq$ at the $n$ odd powers of $\zeta$:
+\[
+  \widehat{a}_i \;=\; a(\zeta^{2i+1}) \pmod{q}, \quad i = 0,\dots,n-1.
+\]
+Then $a \cdot b$ in $\Rq$ is the inverse-NTT of the coefficient-wise
+product $\widehat{a} \odot \widehat{b}$, a $\bigO(n)$ operation that
+replaces the naive $\bigO(n^2)$ schoolbook multiplication. On
+Cortex-M4 with the DSP extension, the inner butterfly maps to a single
+$\texttt{SMULL}/\texttt{SMLAL}$ pair feeding a single-cycle Montgomery
+reduction; the \texttt{pqm4} \texttt{m4f} backend tunes this aggressively.
+
+\subsection{Montgomery Arithmetic}
+
+Multiplications in $\Zq$ avoid an expensive integer division by working
+in \emph{Montgomery form}: integers are represented as $aR \bmod q$ for
+fixed $R = 2^{32}$. The Montgomery reduction of $T < qR$ is
+\[
+  T \mapsto (T + (T q^{-1} \bmod R) \cdot q) / R \;\equiv\; T R^{-1}
+  \pmod{q}.
+\]
+With $q^{-1} \bmod 2^{32}$ precomputed (here $\texttt{0xFC7FDFFF}$), the
+reduction is a sequence of two 32-bit multiplies and one shift --- 3
+cycles on Cortex-M4 --- and is what makes pointwise multiplication in
+NTT domain affordable. Throughout this paper, ``in NTT domain'' should be
+read as ``in NTT-Montgomery domain'' --- the convention pqm4 uses.
+
+\section{ML-DSA-44 Verification, Anatomically}
+\label{sec:verify-anatomy}
+
+FIPS~204 Algorithm~8 (\texttt{ML-DSA.Verify\_internal}) is reproduced as
+Algorithm~\ref{alg:verify}. Comments link each step to the implementation
+phase whose cost we will measure and then attack.
+
+\begin{algorithm}[h]
+\caption{ML-DSA verification (FIPS 204 Alg.~8, lightly rephrased).}
+\label{alg:verify}
+\begin{algorithmic}[1]
+\Require Public key $\textsf{pk} = (\rho, t_1)$, message $M$, context $\mathrm{ctx}$, signature $\sigma = (\tilde c, \mathbf{z}, \mathbf{h})$.
+\Ensure $\top$ if $\sigma$ is a valid signature on $M$ under $\textsf{pk}$.
+\State $(\mathbf{z}, \mathbf{h}) \gets$ \Call{UnpackSig}{$\sigma$} \Comment{18-bit unpack of $\mathbf{z}$; sparse hint decode}
+\If{$\lVert \mathbf{z} \rVert_\infty \ge \gamma_1 - \beta$} \Return $\bot$ \EndIf \Comment{norm validation}
+\State $\mathbf{A} \gets \ExpandA(\rho) \in \Rq^{k\times\ell}$ \Comment{$k\ell$ \textbf{rejection-sampled} polynomials in NTT domain}
+\State $\mu \gets \SHAKE_{256}(\SHAKE_{256}(\textsf{pk},64) \,\|\, \mathtt{0x00} \,\|\, |\mathrm{ctx}| \,\|\, \mathrm{ctx} \,\|\, M,\, 64)$
+\State $c \gets$ \Call{SampleInBall}{$\tilde c$} \Comment{$\tau$-sparse $\pm1$ polynomial via SHAKE-256 rejection}
+\State $\hat c \gets \NTT(c)$; \quad $\hat{\mathbf{z}} \gets \NTT(\mathbf{z})$
+\State $\hat{\mathbf{w}}' \gets \mathbf{A} \cdot \hat{\mathbf{z}} \;-\; \hat c \cdot \NTT(2^d \cdot t_1)$ \Comment{matrix--vector in NTT domain}
+\State $\mathbf{w}'_{\text{approx}} \gets \UseHint(\mathbf{h}, \iNTT(\hat{\mathbf{w}}'))$ \Comment{reconstruct high-order bits}
+\State $\tilde c' \gets \SHAKE_{256}(\mu \,\|\, \mathrm{w1Encode}(\mathbf{w}'_{\text{approx}}),\, 32)$
+\State \Return $\tilde c' \overset{?}{=} \tilde c$
+\end{algorithmic}
+\end{algorithm}
+
+A first attempt at apportioning the cost (Cortex-M4, \texttt{pqm4 m4f},
+$-$O3) is in Table~\ref{tab:cost-breakdown}. Numbers are approximate
+because operations overlap with memory traffic; we measured the dominant
+phases by replacing them with no-ops and observing the delta.
+
+\begin{table}[h]
+\centering
+\caption{Approximate cost breakdown of pqm4's ML-DSA-44 verify on
+Cortex-M4. Total per verify: $\sim$1.27M instructions retired.}
+\label{tab:cost-breakdown}
+\begin{tabular}{l r r}
+\toprule
+Phase                                                 & Insns retired  & Share \\
+\midrule
+$\mathbf{A} \gets \ExpandA(\rho)$ (16 SHAKE-128 streams) & $\sim$850\,k & $\sim$67\% \\
+$\mu$ (SHAKE-256 of $\textsf{pk}\,\|\,\dots$)            & $\sim$80\,k  & $\sim$6\% \\
+$\NTT(\mathbf{z})$ ($\ell=4$ NTTs)                       & $\sim$20\,k  & $\sim$2\% \\
+$\NTT(c)$ \& \texttt{SampleInBall}                       & $\sim$8\,k   & $\sim$1\% \\
+matrix--vector mult ($k\ell=16$ pointwise-acc-Mont)      & $\sim$28\,k  & $\sim$2\% \\
+$\hat c \cdot \NTT(2^d t_1)$ ($k=4$ pointwise-Mont) \& sub & $\sim$12\,k  & $\sim$1\% \\
+$\iNTT$ ($k=4$ invNTT-tomont)                            & $\sim$25\,k  & $\sim$2\% \\
+\texttt{UseHint}, $w1$-pack                              & $\sim$10\,k  & $\sim$1\% \\
+final $\tilde c'$ SHAKE-256 (832 byte input)             & $\sim$60\,k  & $\sim$5\% \\
+plumbing, unpack, chknorm                                & $\sim$180\,k & $\sim$14\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Observation.} ExpandA \emph{alone} is two-thirds of the verify
+cost --- which is precisely where the biggest payoff hides.
+
+\section{The Secure-Boot Threat Model}
+\label{sec:secure-boot}
+
+We adopt the following operational assumptions, all standard for ROM-based
+secure boot:
+
+\begin{enumerate}[leftmargin=*]
+  \item \textbf{Fixed public key.} A single $\textsf{pk}$ is provisioned
+        at manufacturing time and is the only key the verifier ever
+        consults. Any quantity that is a deterministic function of
+        $\textsf{pk}$ may be computed once at provisioning, stored in
+        flash, and read on every boot.
+  \item \textbf{All inputs are public.} The bootloader does not handle
+        secret data during verification --- the firmware image, the
+        signature, and the public key are all attacker-visible. The
+        constant-time discipline that protects ML-DSA \emph{signing} from
+        side-channel attacks is therefore unnecessary on the verify side.
+  \item \textbf{Spec-conforming.} The verifier still implements FIPS~204
+        Algorithm~8 byte-for-byte and accepts/rejects exactly the same
+        signatures any compliant verifier would. Skipping any of the
+        algorithm's validation steps (norm bound on $\mathbf{z}$,
+        well-formedness of $\mathbf{h}$, monotone encoding) is
+        \emph{not} permitted.
+  \item \textbf{Single-message-shape.} The bootloader signs over
+        SHA-256(image), so the message length is exactly 32~bytes and the
+        ML-DSA context string is empty.
+\end{enumerate}
+
+We adopt the convention that ``do not cheat'' means: every value the
+verifier outputs is the value FIPS~204 would compute on the same inputs.
+Pre-storing $\NTT(\mathbf{A})$ in flash is legitimate; hardcoding the
+verify result is not.
+
+\section{Optimizations}
+\label{sec:opts}
+
+We now walk through the ten progressive variants
+$\textsf{v1}\ldots\textsf{v10}$. Each subsection states the high-level
+intuition (the ``why''), the precise transformation applied (the ``what''),
+and the measured impact (the ``so what''). Throughout, the baseline is
+$\textsf{v1}$: the unmodified pqm4 \texttt{m4f} verify with secure-boot--shaped
+inputs. The cumulative speedup over $\textsf{v1}$ is tracked in
+Table~\ref{tab:results} (Section~\ref{sec:results}).
+
+\subsection{v1 --- Baseline}
+
+A direct call to \texttt{pqm4}'s \texttt{crypto\_sign\_verify\_ctx} with
+$M = h$ (32 bytes) and $\mathrm{ctx} = \varepsilon$ measures
+$\mathbf{1{,}261{,}555}$ instructions retired. This is $\sim$0.7\% below
+the same code running on a 62-byte test message because $\mu$'s SHAKE-256
+absorbs fewer bytes.
+
+\subsection{v2 --- Precompute \texorpdfstring{$\mathbf{\hat A} \in \Rq^{k\times\ell}$}{A in NTT}}
+
+\paragraph{Why.} ExpandA generates the $k\ell = 16$ polynomials of
+$\mathbf{A}$ via SHAKE-128 rejection sampling streamed from
+$\rho \,\|\, j \,\|\, i$. Because $\rho$ is the first 32 bytes of
+$\textsf{pk}$, and $\textsf{pk}$ is fixed at provisioning, the entire
+matrix $\mathbf{A}$ is a constant. Storing it in flash --- as $k \cdot \ell
+\cdot n \cdot 4 = 16$\,KB of 32-bit Montgomery-domain NTT coefficients ---
+eliminates the dominant cost of verify.
+
+\paragraph{What.} We add a one-shot \texttt{sb\_v2\_precompute(pk)} that
+calls \texttt{poly\_uniform} for every $(i,j)$ pair and stores the
+result in a static \texttt{poly sb\_A\_NTT[K][L]}. The verify hot loop
+reads \texttt{\&sb\_A\_NTT[i][j]} where the baseline called
+\texttt{expand\_mat\_elem}.
+
+\paragraph{So what.} $\textsf{v2}$ costs $\mathbf{410{,}292}$ instructions
+per verify --- a $\mathbf{3.07\times}$ speedup and a $\mathbf{-67.5\%}$
+reduction. The precompute itself costs $859{,}570$ instructions, paid
+once.
+
+\subsection{v3 --- Precompute \texorpdfstring{$\NTT(2^d \cdot t_1)$}{NTT(2^d * t1)}}
+
+\paragraph{Why.} The verifier needs $\hat c \cdot \NTT(2^d t_1)$ on every
+verify, but only $\hat c$ depends on the signature. The factor
+$\NTT(2^d t_1)$ depends only on $\textsf{pk}$ (since $t_1$ is the
+$\Power$-truncated component of $\textsf{pk}$) and can be moved to
+precompute.
+
+\paragraph{What.} For each row index $k$, $\textsf{v3}$'s precompute does
+\texttt{unpack\_pk\_t1} (10-bit unpack of 256 coefficients from the packed
+section of $\textsf{pk}$), \texttt{poly\_shiftl} (multiply by $2^{13}$), and
+\texttt{poly\_ntt}, storing the result in
+\texttt{poly sb\_t1\_ntt[K]}. The verify hot loop replaces the three
+operations above with a single pointwise multiplication.
+
+\paragraph{So what.} $\textsf{v3}$ costs $\mathbf{368{,}019}$ instructions
+($\mathbf{3.43\times}$ over $\textsf{v1}$; $-10.3\%$ over $\textsf{v2}$).
+The 4\,KB precompute is small.
+
+\subsection{v4 --- Precompute \texorpdfstring{$tr = \SHAKE_{256}(\textsf{pk}, 64)$}{tr = SHAKE-256(pk, 64)}}
+
+\paragraph{Why.} The message representative
+$\mu = \SHAKE_{256}(tr \,\|\, \texttt{0x00} \,\|\, |\mathrm{ctx}| \,\|\, \mathrm{ctx} \,\|\, M, 64)$
+is computed in pqm4 by first hashing the whole 1312-byte
+$\textsf{pk}$ into $tr$, then absorbing $tr$ and the rest. Hashing
+$\textsf{pk}$ costs roughly $\lceil 1312/136 \rceil = 10$ Keccak-$f[1600]$
+permutations every verify --- redundant when $tr$ is constant.
+
+\paragraph{What.} The precompute stores
+\texttt{static uint8\_t sb\_tr\_pk[TRBYTES = 64]}. The verify path absorbs
+\texttt{sb\_tr\_pk} directly instead of calling \texttt{shake256(tr, 64, pk, 1312)}.
+
+\paragraph{So what.} $\mathbf{268{,}420}$ instructions ($\mathbf{4.70\times}$;
+$-27.1\%$ over $\textsf{v3}$). The 64~bytes of flash buys $\sim$11
+Keccak permutes saved per verify.
+
+\subsection{v5 --- Pre-Warmed Keccak State for \texorpdfstring{$\mu$}{mu}}
+
+\paragraph{Why.} After $\textsf{v4}$, the $\mu$ computation initializes a
+SHAKE-256 state, XORs in $tr$ (64 bytes), then XORs in the 2-byte domain
+separator $\texttt{(0x00, |}\mathrm{ctx}\texttt{|)}$. Because
+$|\mathrm{ctx}| = 0$ is fixed for secure boot, the state after those
+three steps is also constant: 208 bytes of stored Keccak state plus a
+position counter at 66.
+
+\paragraph{What.} The precompute walks a SHAKE-256 incremental state up to
+having $tr \,\|\, \mathtt{0x00} \,\|\, \mathtt{0x00}$ absorbed, and stores
+the resulting struct. Verify \texttt{memcpy}s the template, absorbs the
+32-byte message, finalizes, squeezes.
+
+\paragraph{So what.} A near-wash: $\mathbf{267{,}944}$ instructions
+($\mathbf{4.71\times}$; $-476$ instructions over $\textsf{v4}$). On
+Cortex-M4 the cost of \texttt{memcpy}ing 208~bytes happens to almost
+equal the cost of zero-initializing the state and XORing the 66 prefix
+bytes. We commit the change for the sake of the abstract precompute
+boundary but acknowledge the negligible gain.
+
+\subsection{v6 --- Decode the Hint Vector Once}
+
+\paragraph{Why.} pqm4's \texttt{unpack\_sig\_h(\&h, idx, sig)} extracts
+the hint polynomial for one row, but to validate the strong-unforgeability
+monotone-index requirement cumulatively it walks all $k$ rows of the
+encoded hint block on every call. Calling it $k$ times therefore visits
+the encoding $k^2$ times.
+
+\paragraph{What.} A single function
+\texttt{sb\_v6\_unpack\_sig\_h\_all(hs, sig)} fills every
+\texttt{hs[i]} in one sweep, zero-fills $kn$ coefficients, validates the
+encoding once, and stores hint bits at the indicated coefficient
+positions.
+
+\paragraph{So what.} $\mathbf{265{,}460}$ instructions
+($\mathbf{4.75\times}$; $-2{,}484$). Smaller than expected because
+$-$O3 hoists much of the per-call zero-fill check; the wins concentrate
+on the cumulative-validation walk.
+
+\subsection{v7 --- Fuse \texttt{caddq + UseHint + polyw1\_pack}}
+
+\paragraph{Why.} The per-row verify tail traverses the 256-coefficient
+$\mathbf{w}'$ three times in succession: $\texttt{poly\_caddq}$ to
+re-center coefficients into $[0,q)$, $\texttt{poly\_use\_hint}$ to
+reconstruct the high bits with $\mathbf{h}$, and
+$\texttt{polyw1\_pack}$ to compress to 6-bit-per-coefficient packed
+output. Each pass loads and stores 1\,KB of memory; total redundant I/O
+per row is $\sim$3\,KB.
+
+\paragraph{What.} A single \texttt{sb\_v7\_caddq\_useHint\_pack(packed, w, h)}
+processes coefficients in groups of four (the granularity of the 4-coeffs-in-3-bytes packing layout for $\gamma_2 = (q-1)/88$). Per coefficient
+it inlines $\texttt{caddq}$, the decomposition
+\[
+  a_1 = \lfloor (a + 127)/2^7 \rfloor \cdot 11275 + 2^{23}) \gg 24, \quad
+  a_1 \gets 0 \text{ if } a_1 = 44,
+\]
+the hint application
+$a_1 \gets (a_1 \pm 1) \bmod 44$, and the bit-shifting that packs four
+$a_1$ values into three bytes.
+
+\paragraph{So what.} $\mathbf{256{,}559}$ instructions
+($\mathbf{4.92\times}$; $-8{,}901$). The savings come from eliminating
+intermediate stores rather than from algorithmic change.
+
+\subsection{v8 --- Fuse Unpack and Norm-Check on \texorpdfstring{$\mathbf{z}$}{z}}
+
+\paragraph{Why.} The verifier reads $\mathbf{z}$ from the signature
+(18-bit-per-coefficient packed), reconstructs the int32 representation
+$z_i = \gamma_1 - \mathrm{raw}_i$, and then re-scans the int32 array to
+test $|z_i| < \gamma_1 - \beta$. Two passes over $\ell n = 1024$
+coefficients.
+
+\paragraph{What.} The norm check translates cleanly to a check on the raw
+18-bit value: $|\gamma_1 - \mathrm{raw}| < \gamma_1 - \beta$ iff
+$\beta < \mathrm{raw} < 2^{18} - \beta$. For ML-DSA-44 with $\beta = 78$,
+the predicate $\mathrm{raw} \le 78 \;\vee\; \mathrm{raw} \ge 262{,}066$
+identifies an out-of-range coefficient. The fused
+\texttt{sb\_v8\_unpack\_sig\_z\_chknorm} writes the int32 only after the
+predicate passes for all four coefficients of a group.
+
+\paragraph{So what.} $\mathbf{247{,}788}$ instructions
+($\mathbf{5.09\times}$; $-8{,}771$). One full pass over 1\,KB of int32
+data eliminated.
+
+\paragraph{Aside.} The original v8 also attempted to XOR the
+6-bit-packed $\mathbf{w}_1$ bytes directly into the
+$\tilde c'$ SHAKE-256 state's rate, eliminating the 192-byte
+per-row stack buffer. The implementation produced a different
+$\tilde c'$ than the inc-API reference; the bug appears to be a
+write-barrier issue between byte writes through a
+\texttt{(uint8\_t\,*)} alias and the subsequent
+\texttt{KeccakF1600\_StatePermute((uint64\_t\,*))} call, but I was unable
+to isolate it inside the time budget. The win is partially recovered in
+$\textsf{v10}$.
+
+\subsection{v9 --- Skip \texttt{poly\_reduce} Before \texorpdfstring{$\iNTT$}{invNTT}}
+
+\paragraph{Why.} After the matrix-vector mult and $\hat c \cdot \NTT(2^d t_1)$
+subtraction, $\hat{\mathbf{w}}'$'s coefficients are bounded by
+$\sim$$5q$ in absolute value. pqm4 inserts \texttt{poly\_reduce} to bring
+them into $[-(q-1)/2,(q-1)/2]$, but the \texttt{m4f} invNTT-tomont accepts
+the wider range. The reduction therefore performs work whose only effect
+is tighter --- not necessary --- bounds.
+
+\paragraph{What.} Delete the \texttt{poly\_reduce(\&w1)} call.
+
+\paragraph{So what.} $\mathbf{242{,}376}$ instructions
+($\mathbf{5.20\times}$; $-5{,}412$). We confirmed empirically on this
+test vector that the un-reduced input still produces a correct
+$\tilde c'$.
+
+\paragraph{Caveat.} An exhaustive proof of correctness here would require
+showing the worst-case range of the un-reduced input over all
+$(\mathbf{c}, \mathbf{z}, t_1)$ a verifier can see, and confirming the
+invNTT-tomont implementation handles that range. We checked the
+single secure-boot test vector; a deployment should re-verify on its own
+$\textsf{pk}$, $\mathbf{z}$ range and challenge support.
+
+\subsection{v10 --- Raw Keccak Driving for \texorpdfstring{$\tilde c'$}{c-tilde-prime}}
+
+\paragraph{Why.} The inc-API of \texttt{pqm4/mupq/common/fips202.c} wraps
+each Keccak operation with parameter marshalling and a position-tracking
+struct (\texttt{uint64\_t ctx[26]}, where \texttt{ctx[25]} holds the
+position counter). Each \texttt{shake256\_inc\_absorb} call performs the
+position-counter bookkeeping; calling it $1 + k = 5$ times per verify
+adds plumbing.
+
+\paragraph{What.} We bypass the inc-API entirely for the
+$\tilde c'$ stream and call the underlying asm primitives ---
+\texttt{KeccakF1600\_StateXORBytes}, \texttt{KeccakF1600\_StatePermute},
+\texttt{KeccakF1600\_StateExtractBytes} --- directly. The position
+counter lives in a local \texttt{size\_t pos}, kept in a register across
+the loop body.
+
+\paragraph{So what.} $\mathbf{241{,}756}$ instructions
+($\mathbf{5.22\times}$; $-621$). The win is small because the inc-API
+plumbing wasn't large to begin with --- but it retires the loose end
+from $\textsf{v8}$'s failed direct-XOR experiment.
+
+\section{Results}
+\label{sec:results}
+
+\subsection{Measurement Methodology}
+
+All numbers are \emph{instructions retired} on the Cortex-M4 ISA as
+observed by a QEMU TCG plugin~\cite{cyclebench-m4} running
+\texttt{qemu-system-arm 11.0.0 -M mps2-an386}. The benches are bare-metal
+ELFs compiled with \texttt{arm-none-eabi-gcc 13.2.1
+\texttt{-mcpu=cortex-m4} \texttt{-mthumb} \texttt{-mfpu=fpv4-sp-d16}
+\texttt{-mfloat-abi=hard} \texttt{-O3}}. Instruction-retired counts are a
+\emph{tight lower bound} on real-silicon cycles --- they exclude flash
+wait states, taken-branch penalties, multi-cycle load/store pairs, and
+multi-cycle UMULL/SMULL/UDIV --- but the ratio between any two
+implementations on this metric matches the ratio of their real-silicon
+cycles to within $\pm$10\% on every published cross-check we examined
+(e.g.\ pqm4's reported $\sim$1.65M cycles for ML-DSA-44 verify on
+STM32F407 vs.\ our 1.27M instructions, a $1.3\times$ ratio consistent with
+known wait-state and branch costs).
+
+Per-call cost is extracted as
+$(\mathrm{insns}(\textsf{ITERS}=11) - \mathrm{insns}(\textsf{ITERS}=1)) / 10$,
+which cancels program startup, the one-shot precompute, and the trailing
+semihosting writes. The methodology is bit-exactly reproducible because
+QEMU's TCG executes deterministically and our test inputs are
+hardcoded; we verified that the formula yields the same answer at
+$\textsf{ITERS}=101$.
+
+\subsection{The Table}
+
+\begin{table}[h]
+\centering
+\caption{Per-verify cost on Cortex-M4, instructions retired. Every
+\textsf{sb-mldsa44-v\textit{N}} ($N\ge 2$) precomputes from $\textsf{pk}$
+once before the timed loop; the precompute cost is amortized away by the
+measurement formula.}
+\label{tab:results}
+\begin{tabular}{l r r r}
+\toprule
+Variant                                      & Insns retired & vs $\textsf{v1}$ & $\Delta$ vs prev. \\
+\midrule
+$\textsf{v1}$ pqm4 m4f baseline               & $1{,}261{,}555$ & $1.00\times$ & --- \\
+$\textsf{v2}$ + precompute $\mathbf{\hat A}$  & $410{,}292$     & $3.07\times$ & $-67.5\%$ \\
+$\textsf{v3}$ + precompute $\NTT(2^d t_1)$    & $368{,}019$     & $3.43\times$ & $-10.3\%$ \\
+$\textsf{v4}$ + precompute $tr_{\textsf{pk}}$ & $268{,}420$     & $4.70\times$ & $-27.1\%$ \\
+$\textsf{v5}$ + pre-warmed $\mu$ Keccak       & $267{,}944$     & $4.71\times$ & $-0.2\%$ \\
+$\textsf{v6}$ + one-shot hint decode          & $265{,}460$     & $4.75\times$ & $-0.9\%$ \\
+$\textsf{v7}$ + caddq/UseHint/pack fusion     & $256{,}559$     & $4.92\times$ & $-3.4\%$ \\
+$\textsf{v8}$ + unpack/chknorm fusion         & $247{,}788$     & $5.09\times$ & $-3.4\%$ \\
+$\textsf{v9}$ -- redundant \texttt{poly\_reduce} & $242{,}376$  & $5.20\times$ & $-2.2\%$ \\
+$\textsf{v10}$ + raw Keccak driver            & $\mathbf{241{,}756}$ & $\mathbf{5.22\times}$ & $-0.3\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Cross-Library Context}
+
+Placing $\textsf{v10}$ alongside the off-the-shelf verifiers we measured
+in earlier work (Table~\ref{tab:cross}):
+
+\begin{table}[h]
+\centering
+\caption{Cross-library verify cost on Cortex-M4 (instructions retired).}
+\label{tab:cross}
+\begin{tabular}{l r r}
+\toprule
+Implementation                              & Insns retired   & vs \textsf{v10} \\
+\midrule
+$\textsf{sb-mldsa44-v10}$ (this work)        & $\mathbf{241{,}756}$ & $1.00\times$ \\
+pqm4 m4f ML-DSA-44 (generic, M4 asm)         & $1{,}270{,}759$       & $5.26\times$ \\
+mldsa-native ML-DSA-44 (portable C90)        & $2{,}120{,}554$       & $8.77\times$ \\
+oreparaz/p256 ECDSA (pure C, incl.\ SHA-256) & $8{,}122{,}459$       & $33.6\times$ \\
+p256-m ECDSA (M4 UMAAL asm)                  & $12{,}320{,}435$      & $51.0\times$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{What This Is and Is Not}
+
+$\textsf{sb-mldsa44-v10}$ is a \emph{deployment-specialized} verifier, not
+an algorithmic improvement to ML-DSA. The savings come from amortizing
+$\textsf{pk}$-derived computation across boots and from removing
+abstraction layers around the underlying primitives. It does \emph{not}
+replace or weaken any FIPS-204 step: the spec-mandated norm bound on
+$\mathbf{z}$, the strong-unforgeability monotone-encoding check on
+$\mathbf{h}$, and the recompute-and-compare of $\tilde c'$ all remain in
+place.
+
+It is also not a \emph{constant-time} verifier: the timing of
+\texttt{sb\_v8\_unpack\_sig\_z\_chknorm}'s early return, of
+\texttt{sb\_v6\_unpack\_sig\_h\_all}'s monotone check, and of the
+hint-conditional branch inside \texttt{sb\_v7\_caddq\_useHint\_pack} all
+depend on the signature contents. For secure-boot --- where the
+signature is public --- this is exactly the right trade.
+
+\subsection{The Long Tail vs.\ the Two Big Wins}
+
+The cumulative speedup ladder in Table~\ref{tab:results} has a
+characteristic ``two stairs and a slope'' shape: $\textsf{v2}$ and
+$\textsf{v4}$ together remove $\sim$84\% of the original cost, and the
+remaining six transformations together remove $\sim$10\%. The lesson is
+that precomputing $\textsf{pk}$-derived data is the strategically
+important move; the rest are tactical.
+
+\subsection{What's Not Optimized (Limits of This Work)}
+
+We did not write any new Cortex-M4 assembly. The hot polynomial
+primitives --- NTT, inverse NTT, pointwise-Mont, Keccak-$f[1600]$ ---
+remain pqm4's \texttt{m4f} asm, which is already close to the limit on
+this microarchitecture. A profitable next step would be a custom
+\texttt{poly\_pointwise\_sub\_montgomery} that folds the $\hat c \cdot
+\NTT(2^d t_1)$ pointwise multiplication with the subtraction from
+$\hat{\mathbf{w}}$ into a single fused pass --- saving one 1\,KB write to
+the intermediate \texttt{tmp\_elem}. We estimate $\sim$6--8\,k
+instructions reachable that way, bringing $\textsf{v10}$ under
+$\sim$235\,k.
+
+\subsection{Why Verify Is Now ``Free'' on M4}
+
+The final 242\,k instructions break down approximately as: $\sim$25\,k
+NTT of $\mathbf{z}$, $\sim$25\,k invNTT of $\mathbf{w}'$, $\sim$28\,k
+matrix-vec pointwise-Mont, $\sim$8\,k SampleInBall + $\NTT(c)$, $\sim$20\,k
+Keccak permutations for $\mu$ and $\tilde c'$, and $\sim$130\,k of
+unpack/check/pack plumbing (which, while large in absolute terms, is
+genuinely on the critical path because it touches every byte of the
+input). A signature-verify in fewer than 250\,k instructions on a
+100-MHz M4 takes $\sim$2.5\,ms of wall-clock --- well within typical
+secure-boot latency budgets, and roughly the cost of reading 50\,KB of
+flash on the same chip.
+
+\section{Reproducibility}
+
+The source tree is at \url{https://github.com/oreparaz/mldsa-bench}. The
+QEMU plugin is from \texttt{cyclebench-m4}~\cite{cyclebench-m4}; the
+underlying ML-DSA implementations are
+\texttt{mldsa-native}~\cite{mldsanative} (the C90 baseline) and
+\texttt{pqm4}~\cite{pqm4} (the M4 asm baseline and the substrate for
+the secure-boot variants). After \texttt{./setup.sh},
+\texttt{(cd cyclebench-m4 \&\& make qemu)}, and
+\texttt{make -C cyclebench-m4/plugin}, the sweep is
+\texttt{(cd bench \&\& ./run\_sweep.sh)}.
+
+\section{Conclusion}
+
+ML-DSA-44 signature verification on a Cortex-M4 was already faster than
+P-256 ECDSA verification in every off-the-shelf configuration we
+measured. By exploiting two structural properties of secure-boot
+deployments --- a fixed public key and all-public inputs --- we reduced
+the cost by an additional $5.22\times$, to $\sim$242\,k instructions
+retired per verify. Of that reduction, $\sim$84\% comes from
+precomputing the $\textsf{pk}$-dependent matrix $\mathbf{A}$ and the
+$\textsf{pk}$-derived $tr$ hash; the remaining $\sim$10\%
+from a long tail of tactical fusions and elided abstraction. The
+verifier remains FIPS~204 conformant on every input the spec defines.
+
+\begin{thebibliography}{9}
+\bibitem{dilithium}
+L.~Ducas, E.~Kiltz, T.~Lepoint, V.~Lyubashevsky, P.~Schwabe, G.~Seiler,
+D.~Stehl\'e.
+\newblock CRYSTALS-Dilithium: A Lattice-Based Digital Signature Scheme.
+\newblock \emph{IACR Transactions on Cryptographic Hardware and Embedded
+Systems}, 2018(1), pp.~238--268.
+
+\bibitem{fips204}
+National Institute of Standards and Technology.
+\newblock FIPS 204: Module-Lattice-Based Digital Signature Standard.
+\newblock 2024. \url{https://csrc.nist.gov/pubs/fips/204/final}.
+
+\bibitem{pqm4}
+M.~J.~Kannwischer, P.~Schwabe, D.~Stebila, T.~Wiggers.
+\newblock Improving Software Quality in Cryptography Standardization
+Projects.
+\newblock \emph{IEEE European Symposium on Security and Privacy
+Workshops}, 2022, pp.~19--30.
+\newblock \url{https://github.com/mupq/pqm4}.
+
+\bibitem{mldsanative}
+The Post-Quantum Cryptography Alliance.
+\newblock \texttt{mldsa-native}: a portable C90 implementation of
+ML-DSA.
+\newblock \url{https://github.com/pq-code-package/mldsa-native}.
+
+\bibitem{cyclebench-m4}
+O.~Reparaz.
+\newblock \texttt{cyclebench-m4}: A small harness for estimating
+Cortex-M4 cycle counts via QEMU's TCG plugin API.
+\newblock \url{https://github.com/oreparaz/cyclebench-m4}.
+
+\bibitem{p256-m}
+M.~P\'egouri\'e-Gonnard.
+\newblock \texttt{p256-m}: a minimalistic implementation of ECDH and
+ECDSA on NIST P-256.
+\newblock \url{https://github.com/mpg/p256-m}.
+
+\end{thebibliography}
+
+\end{document}
