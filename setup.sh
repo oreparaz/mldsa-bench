@@ -33,6 +33,10 @@ clone https://github.com/mupq/pqm4.git \
 # pqm4 carries its shared sources (fips202, keccakf1600 asm) in a submodule.
 (cd pqm4 && git submodule update --init --recursive --depth=1) >/dev/null
 
+clone https://github.com/FasterKyberDilithiumM4/FasterKyberDilithiumM4.git \
+      daafc401da7d94e983552cbc3ffbde7df9f70c9d \
+      FasterKyberDilithiumM4
+
 echo
 echo "Next: build the plugin-enabled QEMU 11.0.0 and the TCG plugin:"
 echo "  (cd cyclebench-m4 && make qemu) && make -C cyclebench-m4/plugin"

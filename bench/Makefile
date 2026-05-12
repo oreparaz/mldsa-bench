@@ -67,6 +67,19 @@ P256_DIR := $(REPO_ROOT)/p256
 P256_FLAGS = -I$(P256_DIR) -Wno-pedantic -Wno-unused-parameter \
              -Wno-sign-compare
 
+# ---- FasterKyberDilithiumM4 Dilithium2 (round-3 Dilithium, faster NTT) ----
+FKD          := $(REPO_ROOT)/FasterKyberDilithiumM4
+FKD_DIL2_DIR := $(FKD)/crypto_sign/dilithium2/new
+FKD_DIL2_SRCS := $(wildcard $(FKD_DIL2_DIR)/*.c) \
+                 $(wildcard $(FKD_DIL2_DIR)/*.S) \
+                 $(wildcard $(FKD_DIL2_DIR)/*.s)
+FKD_SYMCRYPTO := $(FKD)/common/fips202.c $(FKD)/common/keccakf1600.S
+FKD_FLAGS = -I$(FKD_DIL2_DIR) -I$(FKD)/common \
+            -Wno-pedantic -Wno-sign-conversion -Wno-conversion \
+            -Wno-shadow -Wno-redundant-decls -Wno-missing-prototypes \
+            -Wno-unused-function -Wno-unused-but-set-variable \
+            -Wno-discarded-qualifiers
+
 # ---- pqm4 ML-DSA (m4f-asm-tuned Cortex-M4 backend) ----
 # The verify path pulls in: every .c/.S in crypto_sign/ml-dsa-XX/m4f/ plus
 # the shared symcrypto sources (fips202.c + keccakf1600.S). --gc-sections
@@ -110,13 +123,15 @@ SB_ELFS     := $(addsuffix .elf,$(addprefix $(BUILD)/,$(SB_TARGETS)))
 .PHONY: all \
         mldsa44 mldsa65 mldsa87 \
         mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 \
+        dilithium2-fkd \
         p256-m p256-oreparaz \
         $(SB_TARGETS) \
         $(BUILD)/mldsa44.elf $(BUILD)/mldsa65.elf $(BUILD)/mldsa87.elf \
         $(BUILD)/mldsa-pqm4-44.elf $(BUILD)/mldsa-pqm4-65.elf $(BUILD)/mldsa-pqm4-87.elf \
+        $(BUILD)/dilithium2-fkd.elf \
         $(BUILD)/p256-m.elf $(BUILD)/p256-oreparaz.elf \
         $(SB_ELFS)
-all: mldsa44 mldsa65 mldsa87 mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 p256-m p256-oreparaz $(SB_TARGETS)
+all: mldsa44 mldsa65 mldsa87 mldsa-pqm4-44 mldsa-pqm4-65 mldsa-pqm4-87 dilithium2-fkd p256-m p256-oreparaz $(SB_TARGETS)
 
 mldsa44:        $(BUILD)/mldsa44.elf
 mldsa65:        $(BUILD)/mldsa65.elf
@@ -124,6 +139,7 @@ mldsa87:        $(BUILD)/mldsa87.elf
 mldsa-pqm4-44:  $(BUILD)/mldsa-pqm4-44.elf
 mldsa-pqm4-65:  $(BUILD)/mldsa-pqm4-65.elf
 mldsa-pqm4-87:  $(BUILD)/mldsa-pqm4-87.elf
+dilithium2-fkd: $(BUILD)/dilithium2-fkd.elf
 p256-m:         $(BUILD)/p256-m.elf
 p256-oreparaz:  $(BUILD)/p256-oreparaz.elf
 
@@ -181,6 +197,16 @@ $(BUILD)/mldsa-pqm4-87.elf: | $(BUILD)
 	    $(M4LDFLAGS) -o $@ \
 	    $(REPO_ROOT)/bench/mldsa-pqm4-87/bench_main.c \
 	    $(PQM4_MLDSA87_SRCS) $(PQM4_SYMCRYPTO) $(COMMON_SRCS)
+	@$(SIZE_M4) $@
+
+$(BUILD)/dilithium2-fkd.elf: | $(BUILD)
+	@rm -f $@
+	@echo "  CC[m4] $@ (ITERS=$(ITERS))"
+	@$(CC_M4) $(M4FLAGS_COMMON) $(FKD_FLAGS) \
+	    -DBENCH_ITERS=$(ITERS) \
+	    $(M4LDFLAGS) -o $@ \
+	    $(REPO_ROOT)/bench/dilithium2-fkd/bench_main.c \
+	    $(FKD_DIL2_SRCS) $(FKD_SYMCRYPTO) $(COMMON_SRCS)
 	@$(SIZE_M4) $@
 
 $(BUILD)/p256-m.elf: | $(BUILD)

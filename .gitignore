@@ -12,6 +12,7 @@ build/
 /p256/
 /p256-m/
 /pqm4/
+/FasterKyberDilithiumM4/
 tools/gen_sb_testvec
 
 # LaTeX build intermediates
