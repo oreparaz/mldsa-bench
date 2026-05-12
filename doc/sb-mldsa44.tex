@@ -710,26 +710,34 @@ in earlier work (Table~\ref{tab:cross}):
 \centering
 \caption{Cross-library verify cost on Cortex-M4 (instructions retired
 under $-$O3 with the harness described in
-Section~\ref{sec:results}). The two Dilithium2 entries below the line
-follow the round-3 Dilithium specification rather than FIPS 204
-ML-DSA-44, so they do not share byte-level test vectors with the
-upper entries; the algebra is identical and the instruction counts
-are directly comparable.}
+Section~\ref{sec:results}), with per-key storage and signature size
+alongside so the space-time trade is visible at a glance. The
+Dilithium2 entry follows the round-3 Dilithium specification rather
+than FIPS 204 ML-DSA-44, so it does not share byte-level test
+vectors with the ML-DSA entries; the algebra is identical and the
+instruction counts are directly comparable. P-256 entries
+include sig $=$ raw $(r,s)$ and pk $=$ uncompressed $(x,y)$ without
+a leading $\mathtt{0x04}$ tag.}
 \label{tab:cross}
-\begin{tabular}{l r r}
+\begin{tabular}{l r r r r}
 \toprule
-Implementation                              & Insns retired   & vs \textsf{v10} \\
+Implementation                              & pk (B)      & sig (B)   & Insns retired       & vs \textsf{v10} \\
 \midrule
-$\textsf{sb-mldsa44-v10}$ (this work)        & $\mathbf{241{,}756}$ & $1.00\times$ \\
-pqm4 m4f ML-DSA-44 (generic, M4 asm)         & $1{,}270{,}759$       & $5.26\times$ \\
-mldsa-native ML-DSA-44 (portable C90)        & $2{,}120{,}554$       & $8.77\times$ \\
+$\textsf{sb-mldsa44-v10}$ (this work)        & $20{,}688^\dagger$ & $2{,}420$ & $\mathbf{241{,}756}$ & $1.00\times$ \\
+pqm4 m4f ML-DSA-44 (generic, M4 asm)         & $1{,}312$   & $2{,}420$ & $1{,}270{,}759$      & $5.26\times$ \\
+mldsa-native ML-DSA-44 (portable C90)        & $1{,}312$   & $2{,}420$ & $2{,}120{,}554$      & $8.77\times$ \\
 \midrule
-FasterKyberDilithiumM4 Dilithium2 ``new''~\cite{fkd} & $1{,}335{,}713$ & $5.52\times$ \\
+FasterKyberDilithiumM4 Dilithium2 ``new''~\cite{fkd} & $1{,}312$ & $2{,}420$ & $1{,}335{,}713$ & $5.52\times$ \\
 \midrule
-oreparaz/p256 ECDSA (pure C, incl.\ SHA-256) & $8{,}122{,}459$       & $33.6\times$ \\
-p256-m ECDSA (M4 UMAAL asm)                  & $12{,}320{,}435$      & $51.0\times$ \\
+oreparaz/p256 ECDSA (pure C, incl.\ SHA-256) & $64$        & $64$      & $8{,}122{,}459$      & $33.6\times$ \\
+p256-m ECDSA (M4 UMAAL asm)                  & $64$        & $64$      & $12{,}320{,}435$     & $51.0\times$ \\
 \bottomrule
 \end{tabular}
+\\[2pt]
+\footnotesize $\dagger$ Materialized precompute (16{,}384-byte
+$\hat{\mathbf{A}}$ + 4{,}096-byte $\NTT(2^d t_1)$ + 208-byte
+pre-warmed SHAKE state); the original 1{,}312-byte FIPS-204 pk is no
+longer read at runtime.
 \end{table}
 
 The FasterKyberDilithiumM4 measurement is worth a remark. The repository's
@@ -761,6 +769,114 @@ It is also not a \emph{constant-time} verifier: the timing of
 hint-conditional branch inside \texttt{sb\_v7\_caddq\_useHint\_pack} all
 depend on the signature contents. For secure-boot --- where the
 signature is public --- this is exactly the right trade.
+
+\subsection{Tradeoffs: Space, Provisioning Time, and Brittleness}
+\label{sec:tradeoffs}
+
+The cycle savings come at clear costs in other dimensions. We
+quantify them here so an integrator can decide if the trade fits
+their device.
+
+\paragraph{Expanded public-key footprint.} The native ML-DSA-44 public
+key is 1312 bytes (32-byte $\rho$ seed + $k = 4$ packed
+$\texttt{POLYT1\_PACKEDBYTES} = 320$-byte $t_1$ components). What
+$\textsf{sb-mldsa44-v10}$ actually stores per provisioned key is the
+materialized precompute: the matrix $\hat{\mathbf{A}}$ in
+NTT-Montgomery form, the precomputed $\NTT(2^d \cdot t_1)$, and a
+SHAKE-256 incremental-state template with $tr$ already absorbed
+(Table~\ref{tab:pk-footprint}).
+
+\begin{table}[h]
+\centering
+\caption{Per-public-key storage required by each variant of the
+secure-boot verifier. ELF \texttt{.bss} sizes are reported by
+\texttt{arm-none-eabi-size} on the bench binaries; the precompute
+itself is in \texttt{.bss} in our QEMU harness but would live in
+flash on real silicon.}
+\label{tab:pk-footprint}
+\begin{tabular}{l r r r}
+\toprule
+Variant          & Item                                       & Bytes & Cumulative \\
+\midrule
+$\textsf{v1}$    & FIPS-204 packed $\textsf{pk}$              & $1{,}312$   & $1{,}312$ \\
+$\textsf{v2}$    & + $\hat{\mathbf{A}} \in \mathbb{Z}^{k\ell \cdot n}$ (NTT-Mont)
+                                                              & $16{,}384$  & $17{,}696$ \\
+$\textsf{v3}$    & + $\NTT(2^d t_1)_k \in \mathbb{Z}^{k \cdot n}$ (NTT-Mont)
+                                                              & $4{,}096$   & $21{,}792$ \\
+$\textsf{v5}$    & + pre-warmed SHAKE-256 state (struct)      & $208$       & $22{,}000$ \\
+\midrule
+$\textsf{v10}$  & total (excluding the original 1312-byte $\textsf{pk}$, which the verifier no longer reads at runtime)
+                                                              & ---          & $\mathbf{20{,}688}$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+That is a $\mathbf{15.8\times}$ expansion over the original 1312-byte
+key. Concretely, sustaining $N$ provisioned trust-roots in flash
+(e.g.\ for key rotation, multi-vendor boot, or recovery) costs
+$N \cdot 20.2$~KB instead of $N \cdot 1.3$~KB. On a typical
+M4-class device with 256~KB--1~MB of internal flash this is usually
+affordable for $N \le 10$; on a $\sim$$64$~KB-flash microcontroller
+it is not. Larger parameter sets scale poorly: applying the same
+recipe to ML-DSA-65 would cost $\approx 36.2$~KB per key
+($k\ell = 30$ matrix polynomials + $k = 6$ $t_1$ polynomials), and
+to ML-DSA-87 about $\mathbf{64.2}$~KB per key ($k\ell = 56$ matrix
+polynomials + $k = 8$ $t_1$ polynomials). Code size grows modestly:
+the \texttt{.text} segment is 728 bytes larger in $\textsf{v10}$
+than in $\textsf{v1}$ (about $+3.3\%$), absorbing the precompute
+function, the fused-tail loop, and the hand-driven Keccak helpers.
+
+\paragraph{One-time provisioning cost.} Computing the precompute
+table costs $\approx 1{,}004{,}000$ instructions retired (measured
+as the $\textsf{ITERS}=0$ baseline of $\textsf{v10}$ minus the
+$178$-instruction startup of $\textsf{v1}$). On a 100~MHz M4 with a
+typical $1.3$--$2.5\times$ cycles-per-instruction-retired ratio for
+Cortex-M4 cryptographic code, that is $13$--$25$~ms of one-shot work
+at factory provisioning time --- negligible compared to a device's
+manufacturing flash-write cost. Devices that allow secure-boot key
+rotation in the field would pay the same cost per rotation.
+
+\paragraph{Brittleness to upstream changes.} The precomputed
+$\hat{\mathbf{A}}$ and $\NTT(2^d t_1)$ tables are stored in
+\texttt{pqm4 m4f}'s internal NTT-Montgomery representation: each
+32-bit limb is a particular signed residue modulo $q$ in the
+specific Montgomery-form, NTT-bit-reversed layout that
+\texttt{ntt.S} and \texttt{pointwise\_mont.s} consume. A future
+pqm4 update that changes the bit-reversal layout, the Montgomery
+$R$, or the choice of $\zeta$ silently invalidates every stored
+precompute. Production deployments should pin
+the pqm4 commit hash alongside the precompute and re-derive on any
+toolchain bump --- the same hygiene one applies to JIT cache files.
+
+\paragraph{No saving in signature size or transmission cost.} The
+signature itself is unchanged: $32 + \ell\cdot 576 + (\omega + k) =
+2{,}420$~bytes for ML-DSA-44. If the bottleneck of the deployment
+is the signature transmission rather than verify cycles (e.g.\ a
+firmware update over a constrained radio), $\textsf{sb-mldsa44-v10}$
+provides no help. For comparison: P-256 signatures are 64 bytes and
+Ed25519 signatures are 64 bytes; ML-DSA-44 is about $38\times$
+larger.
+
+\paragraph{Side-channel posture.} Several of the optimizations
+deliberately break the constant-time discipline that pqm4 maintains
+on the signing side: $\textsf{v6}$'s monotone-encoding check exits
+on the first malformed byte; $\textsf{v7}$'s tail branches on the
+hint bit and on the sign of $a_0$; $\textsf{v8}$'s unpack-and-
+chknorm fast-rejects on the first out-of-range coefficient. None
+of these leak secret information --- the verify-time inputs
+($\textsf{pk}$, $\sigma$, $M$) are public --- but a deployment that
+ports this verifier into a context where the signature is somehow
+private (e.g.\ a sealing/decryption use case) would need to revisit
+each fast-path.
+
+\paragraph{Per-verify dynamic memory.} The verify routine allocates
+its working polynomials on the stack: $\hat{\mathbf{z}}$ ($\ell \cdot
+n \cdot 4 = 4$~KB), $\mathbf{h}$-vector ($k \cdot n \cdot 4 = 4$~KB),
+the per-row temporaries ($2 \cdot n \cdot 4 = 2$~KB), the Keccak
+state buffers, and the smaller $\tilde c$, $c_2$, $\mu$ arrays.
+Stack high-water mark is approximately $12$~KB, the same shape as
+\texttt{pqm4 m4f}'s baseline. The extra static \texttt{.bss}
+($20.2$~KB) is on top of, not in place of, that stack budget.
 
 \subsection{The Long Tail vs.\ the Two Big Wins}
 
